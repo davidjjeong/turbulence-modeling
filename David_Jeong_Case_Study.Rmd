@@ -1,0 +1,592 @@
+---
+title: Effect of Turbulent Intensity, Gravity, and Particle Charateristic on Particle Clustering Distribution
+author: "David Jeong"
+date: 2025/10/28
+output:
+  pdf_document: default
+  html_document: default
+fontsize: 10pt
+header-includes:
+- \usepackage{amsmath}
+geometry: margin=0.5in
+---
+
+## Introduction
+
+Particle-laden turbulent flows appear in various engineering systems and natural phenomena. Yet understanding the interaction of inertial particles in turbulence may be extremely difficult to understand. In this study, we aim to explore the effect of fluid turbulence (quantified by Reynolds number, $Re$), gravitational acceleration (quantified by Froud number, $Fr$), and particle characteristics (quantified by Stokes number, $St$) on spatial distribution and clustering of particles in an idealized turbulence.
+
+Specifically, we develop machine learning models to understand the relationship with two key objectives in mind:
+
+-   *Inference*: Investigate and interpret how each parameter ($Re$, $Fr$, $St$) affects the probability distribution for particle cluster volumes.
+
+-   *Prediction*: For unseen values of ($Re$, $Fr$, $St$), predict its particle cluster volume distribution in terms of mean, standard deviation, skewness, and kurtosis.
+
+For the purpose of inference, we present that the following multiple linear regression models for mean ($\mu$), standard deviation ($\sigma$), skewness ($\gamma$), and kurtosis ($\kappa$) with appropriate variable transformations show a good fit and model interpretability on the training data:
+
+\begin{equation}
+\hat{\mu_t}=2.846-0.0678\cdot\text{Re}+0.113\log(\text{St})-1.402\log(\text{Fr}^*)+\\0.00320\cdot\text{Re}\cdot\log({\text{St}})+0.00857\cdot\text{Re}\cdot\log({\text{Fr}^*}) \tag{1}
+\end{equation}
+
+\begin{equation}
+\hat{\sigma_t}=1.476-0.0140\cdot\text{Re}+0.647\log(\text{St})-1.213\log(\text{Fr}^*) \tag{2}
+\end{equation}
+
+\begin{align*}
+\hat{\gamma_t}=6.228\times10^2-1.534\times\text{Re}+1.264\times\log(\text{St})-1.712\times10^3\text{Fr}^* + 1.089\times10^3(\text{Fr}^*)^2 \\ -7.837\times10^{-3}\times\text{Re}\times\log(\text{St})+4.432\times\text{Re}\times\text{Fr}^*-2.825\times\text{Re}\times(\text{Fr}^*)^2 \tag{3}
+\end{align*}
+
+\begin{align*}
+\hat{\kappa_t}=1.240\times10^3-3.032\times\text{Re}+1.832\times\log(\text{St})-3.407\times10^3\text{Fr}^* + 2.167\times10^3(\text{Fr}^*)^2 \\
+-1.475\times10^{-2}\times\text{Re}\times\log(\text{St})+8.758\times\text{Re}\times\text{Fr}^*-5.580\times\text{Re}\times(\text{Fr}^*)^2 \tag{4}
+\end{align*}
+
+where $\hat{\mu_t}=\dfrac{\hat{\mu}^{-0.25}-1}{-0.25}$ , $\hat{\sigma_t}=\dfrac{\hat{\sigma}^{-0.25}-1}{-0.25}$, $\hat{\gamma_t}=\dfrac{\hat{\gamma}^{0.5}-1}{0.5}$, $\hat{\kappa_t}=\dfrac{\hat{\kappa}^{0.25}-1}{0.25}$, and $\text{Fr}^* = \dfrac{1}{1 + e^{-Fr}}$.
+
+For the purpose of prediction, we present that a random forest model with number of trees chosen from k-fold cross validation may be more suitable for prediction, given that the parameters $Re$, $St$, $Fr$ suggest a complex non-linear relationship with the particle clustering distribution, and the model is robust to noise due to averaging over many trees.
+
+## Methodology
+
+```{r, include=FALSE, echo=FALSE, message=FALSE, warning=FALSE}
+# Install packages
+install.packages(c("readr", "dplyr", "moments", "ggplot2", "caret", "patchwork"), repos="https://cloud.r-project.org")
+```
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+# Load packages
+library(dplyr)
+library(readr)
+library(moments)
+library(MASS)
+library(ggplot2)
+library(caret)
+library(glmnet)
+library(patchwork)
+library(randomForest)
+```
+
+```{r, echo=FALSE}
+# Read train, test data from csv files
+train <- read.csv("data-train.csv")
+test <- read.csv("data-test.csv")
+```
+
+```{r, echo=FALSE}
+# Extract raw moments E(X), E(X^2), E(X^3), E(X^4) from train data
+raw_moments <- as.matrix(train[,c("R_moment_1", "R_moment_2", "R_moment_3", "R_moment_4")])
+
+# Compute central moments
+raw_moments <- cbind(R_moment_0 = 1, raw_moments)
+central_moments <- t(apply(raw_moments, 1, raw2central))
+colnames(central_moments) <- c("c_m_0", "c_m_1", "c_m_2", "c_m_3", "c_m_4")
+
+# Attach central moments to train data
+train <- cbind(train, central_moments)
+
+# Derive summary statistics
+train_new <- train %>%
+  mutate(
+    mean = R_moment_1,
+    sd = sqrt(c_m_2),
+    skew = c_m_3 / sd^3,
+    kurt = c_m_4 / sd^4
+  )
+
+# Clean data to have only the predictor and response
+train_new <- train_new %>%
+  dplyr::select(mean, sd, skew, kurt, Re, St, Fr)
+```
+
+```{r, echo=FALSE}
+# Show summary of predictors and response
+summary(train_new)
+```
+
+### Inference
+
+To derive the inference models $(1)$, $(2)$, $(3)$, and $(4)$, we transformed $Fr$, which had a value of infinity, by applying a sigmoid function so that its domain can be mapped to $[0, 1]$ and the parameter can be used to fit the linear model.
+
+Then, we considered the distribution of $\mu$, $\sigma$, $\gamma$, and $\kappa$ through their histograms, which suggested a heavy right-skew. Hence box-cox transformations of the summary statistics were computed to reduce the heavy tails in the distributions, specifically $\mu_t$, $\sigma_t$, $\gamma_t$, and $\kappa_t$ as shown earlier.
+
+```{r, echo=FALSE}
+# Transform Fr using sigmoid function to map Inf values to 1
+train_new$Fr_trans = 1 / (1 + exp(-train_new$Fr))
+```
+
+```{r, echo=FALSE}
+# Distribution of Mean
+dist_mean <- ggplot(train_new, aes(x = mean)) +
+  geom_histogram(bins = 30, fill="steelblue") +
+  labs(title = "Distribution of Mean",
+       x = "Mean",
+       y = "Count") +
+  theme_bw()
+```
+
+```{r, echo=FALSE}
+dist_sd <- ggplot(train_new, aes(x = sd)) +
+  geom_histogram(bins = 30, fill="steelblue") +
+  labs(title = "Distribution of SD",
+       x = "Standard Deviation",
+       y = "Count") +
+  theme_bw()
+```
+
+```{r, echo=FALSE}
+dist_skew <- ggplot(train_new, aes(x = skew)) +
+  geom_histogram(bins = 30, fill="steelblue") +
+  labs(title = "Distribution of Skewness",
+       x = "Skewness",
+       y = "Count") +
+  theme_bw()
+```
+
+```{r, echo=FALSE}
+dist_kurt <- ggplot(train_new, aes(x = kurt)) +
+  geom_histogram(bins = 30, fill="steelblue") +
+  labs(title = "Distribution of Kurtosis",
+       x = "Kurtosis",
+       y = "Count") +
+  theme_bw()
+```
+
+```{r, echo=FALSE}
+(dist_mean | dist_sd) / (dist_skew | dist_kurt)
+```
+
+```{r, echo=FALSE, include=FALSE}
+b_mean <- boxcox(lm(mean ~ Re + Fr_trans + St, data = train_new))
+b_sd <- boxcox(lm(sd ~ Re + Fr_trans + St, data = train_new))
+b_skew <- boxcox(lm(skew ~ Re + Fr_trans + St, data = train_new))
+b_kurt <- boxcox(lm(kurt ~ Re + Fr_trans + St, data = train_new))
+
+lambda_mean <- b_mean$x[which.max(b_mean$y)]
+lambda_sd <- b_sd$x[which.max(b_sd$y)]
+lambda_skew <- b_skew$x[which.max(b_skew$y)]
+lambda_kurt <- b_kurt$x[which.max(b_kurt$y)]
+print(c(lambda_mean, lambda_sd, lambda_skew, lambda_kurt))
+```
+
+```{r, echo=FALSE, include=FALSE}
+# Transform the response variables based on box-cox transformation results
+train_new <- train_new %>%
+  mutate(
+    mean_trans = (mean^(-0.25) - 1) / -0.25,
+    sd_trans = (sd^(-0.25) - 1) / -0.25,
+    skew_trans = (skew^(0.5) - 1) / 0.5,
+    kurt_trans = (kurt^(0.25) - 1) / 0.25
+  )
+
+lmfit_bc <- lm(cbind(mean_trans, sd_trans, skew_trans, kurt_trans) ~ Re + St + Fr_trans, data = train_new)
+summary(lmfit_bc)
+```
+
+Next, the correlation between the predictors and the transformed responses was taken into account by looking at the pairwise plots. While $Re$ seem to have a linear relationship with the summary statistics, $St$ seem to have a logarithmic relationship with the response. On the other hand, $Fr$ seem to share a logarithmic curve with $\mu$ and $\sigma$ but reasonably a quadratic relationship with $\gamma$, $\kappa$. Based on these non-linear relationships, appropriate predictor transformations were made to ensure linearity for fitting linear regression.
+
+```{r, include=FALSE, warning=FALSE, message=FALSE, echo=FALSE}
+# Pairwise plots
+pairs_mean = train_new %>% 
+  dplyr::select(mean_trans, Re, St, Fr_trans)
+
+pairs_sd = train_new %>% 
+  dplyr::select(sd_trans, Re, St, Fr_trans)
+
+pairs_skew = train_new %>% 
+  dplyr::select(skew_trans, Re, St, Fr_trans)
+
+pairs_kurt = train_new %>%
+  dplyr::select(kurt_trans, Re, St, Fr_trans)
+
+par(mfrow=c(2,2))
+pairs(pairs_mean)
+pairs(pairs_sd)
+pairs(pairs_skew)
+pairs(pairs_kurt)
+```
+
+```{r, echo=FALSE, include=FALSE}
+# Fit MLR with these transformed predictors
+lmfit2_mean <- lm(mean_trans ~ Re + log(St) + log(Fr_trans), data = train_new)
+lmfit2_sd <- lm(sd_trans ~ Re + log(St) + log(Fr_trans), data = train_new)
+lmfit2_skew <- lm(skew_trans ~ Re + log(St) + Fr_trans + I(Fr_trans^2), data = train_new)
+lmfit2_kurt <- lm(kurt_trans ~ Re + log(St) + Fr_trans + I(Fr_trans^2), data = train_new)
+
+summary(lmfit2_mean)
+summary(lmfit2_sd)
+summary(lmfit2_skew)
+summary(lmfit2_kurt)
+```
+
+In addition to the transformation of predictors, we also consider potential interaction effects between parameters in our inference model, which was systematically chosen by fitting a lasso model to shrink the insignificant predictor terms. The predictors turned out to be significant by the lasso models were then re-fitted into a multiple linear regression model, so that any main effects considered insignificant but its interaction effects considered significant can be included with respect to the hierarchy principle. Model conditions were checked using diagnostic plots to ensure that linearity, normal residual distribution, constant variance, and independence were satisfied.
+
+Given that the pairwise plots already suggest a complex, non-linear relationship between the parameters and summary statistics, using a linear model for inference may be considered appropriate as it provides an intuitive insight into how each predictor, $Re$, $St$, $Fr$ and their interactions, affects the particle clustering distribution. As long as model conditions are satisfied through variable transformations, it is reasonable to use a linear model to simplify our understanding of turbulence.
+
+### Prediction
+
+Given that prediction is focused on increasing predictive accuracy rather than interpretability, we suggest that a random forest model may be suitable for our problem. This is because random forest uses partition space to model the complex, non-linear relationship between $Re$, $Fr$, $St$ and summary statistics of particle clustering distribution, which has been observed in the pairwise plots when building the model for inference. Also, it is robust to outliers and noise, which may exist in our tiny dataset of $n = 89$ observations, given that it is averaged out over many trees.
+
+While there are other non-linear model options such as generalized additive model (GAM), the fact that only three distinct values are given for the Reynolds and Froude number render GAM unsuitable in our context. GAM's smooth function expects a predictor that wiggles across a continuous range, so it will struggle in this case as there are too few unique data points to smooth.
+
+In order to find the model that minimizes the test MSE value of our training data, we conducted a 5-fold cross validation over a list of `ntree` values ranging from 100 to 2000 by an interval of 50, where `ntree` represents the number of decision trees in the random forest. The folds were created with stratified random sampling in terms of the combination of $Re$, $St$, and $Fr$ values to prevent an imbalanced data between train and validation split.
+
+```{r, echo=FALSE, include=FALSE}
+# Divide into X and Y first
+X_train <- train_new %>%
+  dplyr::select(Re, St, Fr, Fr_trans)
+Y_train <- train_new %>%
+  dplyr::select(mean_trans, sd_trans, skew_trans, kurt_trans, 
+                mean, sd, skew, kurt)
+
+# For stratified random sampling later
+set.seed(7)
+X_train$St_bin <- ntile(X_train$St, 2) # split St into two bins
+X_train$strata <- paste(X_train$Re, X_train$Fr, X_train$St_bin, sep="_")
+```
+
+```{r, echo=FALSE, include=FALSE, warning=FALSE, message=FALSE}
+# Lasso on mean prediction with train split
+library(glmnet)
+set.seed(7)
+X_train_mean <- model.matrix(~ (Re + log(St) + log(Fr_trans))^2, 
+                             data = X_train)
+
+lasso_mean <- cv.glmnet(X_train_mean, Y_train$mean_trans, alpha = 1)
+coef(lasso_mean, s = lasso_mean$lambda.min)
+
+# Lasso on sd prediction with train split
+X_train_sd <- model.matrix(~ (Re + log(St) + log(Fr_trans))^2, 
+                             data = X_train)
+
+lasso_sd <- cv.glmnet(X_train_sd, Y_train$sd_trans, alpha = 1)
+coef(lasso_sd, s = lasso_sd$lambda.min)
+
+# Lasso on skew prediction with train split
+X_train_skew <- model.matrix(~ (Re + log(St) + Fr_trans + I(Fr_trans^2))^2, 
+                             data = X_train)
+
+lasso_skew <- cv.glmnet(X_train_skew, Y_train$skew_trans, alpha = 1)
+coef(lasso_skew, s = lasso_skew$lambda.min)
+
+# Lasso on kurt prediction with train split
+X_train_kurt <- model.matrix(~ (Re + log(St) + Fr_trans + I(Fr_trans^2))^2, 
+                             data = X_train)
+
+lasso_kurt <- cv.glmnet(X_train_kurt, Y_train$kurt_trans, alpha = 1)
+coef(lasso_kurt, s = lasso_kurt$lambda.min)
+```
+
+```{r, echo=FALSE, include=FALSE}
+# Refit hierarchical linear model on train data
+best_lmfit_mean <- lm(mean_trans ~ (Re + log(St) + log(Fr_trans))^2,
+                      data = train_new)
+best_lmfit_sd <- lm(sd_trans ~ Re + log(St) + log(Fr_trans) + Re:log(St) +
+                    Re:log(Fr_trans), data = train_new)
+best_lmfit_skew <- lm(skew_trans ~ Re + log(St) + Fr_trans + I(Fr_trans^2) +
+                      Re:log(St) + Re:Fr_trans + Re:I(Fr_trans^2) +
+                      log(St):Fr_trans, data = train_new)
+best_lmfit_kurt <- lm(kurt_trans ~ Re + log(St) + Fr_trans + I(Fr_trans^2) +
+                      Re:log(St) + Re:Fr_trans + Re:I(Fr_trans^2) +
+                      log(St):Fr_trans, data = train_new)
+
+summary(best_lmfit_mean)
+summary(best_lmfit_sd)
+summary(best_lmfit_skew)
+summary(best_lmfit_kurt)
+```
+
+## Results
+
+### Model Conditions
+
+```{r, echo=FALSE, fig.height=3, fig.width=3, fig.cap="Diagnostic Plots for Model (3), Skewness"}
+# Plot diagnostic plots for each model
+par(mfrow=c(2,2), mar=c(3,3,2,1), oma=c(0,0,2,0))
+plot(best_lmfit_skew, main="", sub="")
+```
+
+Fig. 1. represents diagnostic plots for Model $(3)$ used to predict skewness. We see that linearity and constant variance are roughly satisfied given that most data points seem to be randomly scattered in the residuals vs. fitted plot, and the red trendline in the scale-location plot is fairly horizontal throughout. Except a little deviation at the tails, the Q-Q residuals plot shows that the residuals have a fairly normal distribution. In the residuals vs. leverage plot, there may be some points with high residuals, but most points seem to be scattered around the zero-residual, nor a curvature or a distinct funnel shape is observed. Assuming independence in data generation, we may expect our inference model (while not shown, other models have similar diagnostic plots as well) to satisfy the model conditions, and it may be reasonable to present our scientific insights based on these models.
+
+### Scientific Insights
+
+Model $(1)$ reveals that $\mu_t$, the transformed mean, is strongly influenced by the Froude number given the large negative coefficient of -1.402. This suggests that gravity suppresses clustering, pulling particles down and preventing large aggregates from forming, which decreases the cluster volume on average. The positive coefficient (0.113) of $\log(\text{St})$ shows that larger Stokes number increases cluster volume. This indicates that particles with greater inertia is less prone to small-scale turbulent fluctuations and more likely to coalesce into bigger clusters. As for $Re$, the small negative coefficient of -0.0678 signifies that greater turbulent intensity may break up clusters. The positive coefficients of interaction effects suggest that at higher values of $Re$, the influence of $St$ on cluster volume is amplified, and the negative effect of gravity is slightly offset.
+
+As for Model $(2)$, it suggests that gravity not only reduces average cluster volume but also limits the spread, as evidenced by the negative coefficient of the main effect (-1.213). The Stokes number has a moderate positive effect with a coefficient of 0.647 on its log transformation, meaning that higher particle inertia increases the spread of cluster volumes. Reynolds number has a slight negative effect. Physically, greater turbulence may homogenize cluster sizes slightly.
+
+Model $(3)$ is concerned with the skewness of particle cluster volume. $Re$ has a small negative effect, indicating that more chaotic flows reduce asymmetry in cluster volume. $St$ has a small positive effect; higher particle inertia increases asymmetry, enabling some clusters to grow much larger than others. Froude number is interesting in this model equation, as the linear term greatly reduces skewness at small values of $Fr$, but at very high values, the effect may taper or reverse due to the quadratic term. The interaction terms show that some interplays between particle inertia, turbulent intensity, and gravity promote extremely large clusters, while others suppress them.
+
+Model $(4)$ represents the physics of kurtosis and the effect of $Re$, $St$, and $Fr$ on it. The negative coefficient of -3.032 for Reynolds number hints at how greater turbulence slightly tends towards a more normal distribution of cluster sizes. The positive effect of 1.832 on log transformation of Stokes number shows that particles with high inertia are more likely to form extreme clusters, producing heavy tails in the distribution. The Froude number is also an interesting case here in the model equation: at low values, it leads to a strong decrease in kurtosis with a negative coefficient of -3407, but at higher values, the quadratic term offsets this with a strong positive coefficient of 2167. The interaction terms suggest that there is a complex nonlinear coupling between kurtosis and gravity, while at higher values of $Re$, the positive effect of Stokes number is slightly dampened.
+
+```{r, echo=FALSE, include=FALSE}
+# Refit discarding insignificant interaction terms
+best_lmfit_mean <- lm(mean_trans ~ Re + log(St) + log(Fr_trans) + Re:log(St) +
+                      Re:log(Fr_trans), data = train_new)
+best_lmfit_sd <- lm(sd_trans ~ Re + log(St) + log(Fr_trans), 
+                    data = train_new)
+best_lmfit_skew <- lm(skew_trans ~ Re + log(St) + Fr_trans + I(Fr_trans^2) +
+                      Re:log(St) + Re:Fr_trans + Re:I(Fr_trans^2), data = train_new)
+best_lmfit_kurt <- lm(kurt_trans ~ Re + log(St) + Fr_trans + I(Fr_trans^2) +
+                      Re:log(St) + Re:Fr_trans + Re:I(Fr_trans^2), data = train_new)
+
+summary(best_lmfit_mean)
+summary(best_lmfit_sd)
+summary(best_lmfit_skew)
+summary(best_lmfit_kurt)
+```
+
+### Prediction Results
+
+```{r, echo=FALSE, include=FALSE}
+# List of ntree values to test for k-fold CV
+ntree_grid <- seq(100, 2000, by = 50)
+k <- 5
+cv_mse_mean <- matrix(NA, nrow=length(ntree_grid), ncol=k)
+cv_mse_sd <- matrix(NA, nrow=length(ntree_grid), ncol=k)
+cv_mse_skew <- matrix(NA, nrow=length(ntree_grid), ncol=k)
+cv_mse_kurt <- matrix(NA, nrow=length(ntree_grid), ncol=k)
+# Create stratified folds
+folds <- createFolds(X_train$strata, k = k, list=TRUE, returnTrain = TRUE)
+```
+
+```{r, echo=FALSE, include=FALSE}
+library(randomForest)
+set.seed(7)
+
+for(i in seq_along(ntree_grid)){
+  for(j in 1:k){
+    train_index <- folds[[j]]
+    train_fold <- cbind(X_train[train_index,], Y_train[train_index,])
+    valid_fold <- cbind(X_train[-train_index,], Y_train[-train_index,])
+    
+    rf_model <- randomForest(mean ~ Re + St + Fr_trans,
+                             data = train_fold,
+                             ntree = ntree_grid[i])
+    pred <- predict(rf_model, newdata=valid_fold)
+    cv_mse_mean[i, j] <- mean((pred - valid_fold$mean)^2)
+  }
+}
+
+# Average CV MSE across folds
+mean_cv_mse <- rowMeans(cv_mse_mean)
+# Find best ntree
+best_ntree_mean <- ntree_grid[which.min(mean_cv_mse)]
+print(c(best_ntree_mean, min(mean_cv_mse)))
+```
+
+```{r, echo=FALSE, include=FALSE}
+set.seed(7)
+for(i in seq_along(ntree_grid)){
+  for(j in 1:k){
+    train_index <- folds[[j]]
+    train_fold <- cbind(X_train[train_index,], Y_train[train_index,])
+    valid_fold <- cbind(X_train[-train_index,], Y_train[-train_index,])
+    
+    rf_model <- randomForest(sd ~ Re + St + Fr_trans,
+                             data = train_fold,
+                             ntree = ntree_grid[i])
+    pred <- predict(rf_model, newdata=valid_fold)
+    cv_mse_sd[i, j] <- mean((pred - valid_fold$sd)^2)
+  }
+}
+
+# Average CV MSE across folds
+mean_cv_sd <- rowMeans(cv_mse_sd)
+# Find best ntree
+best_ntree_sd <- ntree_grid[which.min(mean_cv_sd)]
+print(c(best_ntree_sd, min(mean_cv_sd)))
+```
+
+```{r, echo=FALSE, include=FALSE}
+set.seed(7)
+for(i in seq_along(ntree_grid)){
+  for(j in 1:k){
+    train_index <- folds[[j]]
+    train_fold <- cbind(X_train[train_index,], Y_train[train_index,])
+    valid_fold <- cbind(X_train[-train_index,], Y_train[-train_index,])
+    
+    rf_model <- randomForest(skew ~ Re + St + Fr_trans,
+                             data = train_fold,
+                             ntree = ntree_grid[i])
+    pred <- predict(rf_model, newdata=valid_fold)
+    cv_mse_skew[i, j] <- mean((pred - valid_fold$skew)^2)
+  }
+}
+
+# Average CV MSE across folds
+mean_cv_skew <- rowMeans(cv_mse_skew)
+# Find best ntree
+best_ntree_skew <- ntree_grid[which.min(mean_cv_skew)]
+print(c(best_ntree_skew, min(mean_cv_skew)))
+```
+
+```{r, echo=FALSE, include=FALSE}
+set.seed(7)
+for(i in seq_along(ntree_grid)){
+  for(j in 1:k){
+    train_index <- folds[[j]]
+    train_fold <- cbind(X_train[train_index,], Y_train[train_index,])
+    valid_fold <- cbind(X_train[-train_index,], Y_train[-train_index,])
+    
+    rf_model <- randomForest(kurt ~ Re + St + Fr_trans,
+                             data = train_fold,
+                             ntree = ntree_grid[i])
+    pred <- predict(rf_model, newdata=valid_fold)
+    cv_mse_kurt[i, j] <- mean((pred - valid_fold$kurt)^2)
+  }
+}
+
+# Average CV MSE across folds
+mean_cv_kurt <- rowMeans(cv_mse_kurt)
+# Find best ntree
+best_ntree_kurt <- ntree_grid[which.min(mean_cv_kurt)]
+print(c(best_ntree_kurt, min(mean_cv_kurt)))
+```
+
+```{r, echo=FALSE, include=FALSE}
+# Organize findings into a table
+library(knitr)
+
+rf_results <- data.frame(
+  Statistic = c("Mean", "Sd", "Skewness", "Kurtosis"),
+  optimal_ntree = c(1300, 1500, 750, 150),
+  test_rmse = c(0.0193, 5.074, 43.322, 17751.755)
+)
+
+kable(rf_results, caption="Optimal ntree and Test RMSE of Random Forest Models for Mean, Std, Skewness, and Kurtosis")
+```
+
+```{r, echo=FALSE, include=FALSE}
+# Show ranges of mean, std, skewness, kurtosis
+library(dplyr)
+library(tidyr)
+library(knitr)
+
+summary_table <- train_new %>%
+  summarise(across(
+    c(mean, sd, skew, kurt),
+    list(min = ~min(.x, na.rm = TRUE),
+         mean = ~mean(.x, na.rm = TRUE),
+         max = ~max(.x, na.rm = TRUE))
+  )) %>%
+  pivot_longer(
+    everything(),
+    names_to = c("Response", "Statistic"),
+    names_sep = "_"
+  ) %>%
+  pivot_wider(
+    names_from = Statistic,
+    values_from = value
+  )
+
+kable(summary_table, caption = "Min, Max, and Mean of Summary Statistics",
+      digits = 5)
+```
+
+```{r, echo=FALSE}
+# Prediction on the hold-out data set
+set.seed(7)
+best_rf_mean <- randomForest(mean ~ Re + St + Fr_trans, data = train_new, ntree = 1300)
+best_rf_sd <- randomForest(sd ~ Re+St+Fr_trans, data = train_new, ntree = 1500)
+best_rf_skew <- randomForest(skew ~ Re+St+Fr_trans, data = train_new, ntree = 750)
+best_rf_kurt <- randomForest(kurt ~ Re+St+Fr_trans, data = train_new, ntree = 150)
+```
+
+```{r, echo=FALSE}
+# Modify Fr in test data
+test$Fr_trans = 1 / (1 + exp(-test$Fr))
+
+# Predict mean, sd, skew, kurt
+pred_mean <- predict(best_rf_mean, newdata=test, predict.all = TRUE)
+pred_sd <- predict(best_rf_sd, newdata=test, predict.all = TRUE)
+pred_skew <- predict(best_rf_skew, newdata=test, predict.all = TRUE)
+pred_kurt <- predict(best_rf_kurt, newdata=test, predict.all = TRUE)
+
+# Get sd across trees
+pred_mean_sd <- apply(pred_mean$individual, 1, sd)
+pred_sd_sd <- apply(pred_sd$individual, 1, sd)
+pred_skew_sd <- apply(pred_skew$individual, 1, sd)
+pred_kurt_sd <- apply(pred_kurt$individual, 1, sd)
+
+# 95% prediction interval
+pred_lower_mean <- pred_mean$aggregate - 1.96 * pred_mean_sd
+pred_upper_mean <- pred_mean$aggregate + 1.96 * pred_mean_sd
+
+pred_lower_sd <- pred_sd$aggregate - 1.96 * pred_sd_sd
+pred_upper_sd <- pred_sd$aggregate + 1.96 * pred_sd_sd
+
+pred_lower_skew <- pred_skew$aggregate - 1.96 * pred_skew_sd
+pred_upper_skew <- pred_skew$aggregate + 1.96 * pred_skew_sd
+
+pred_lower_kurt <- pred_kurt$aggregate - 1.96 * pred_kurt_sd
+pred_upper_kurt <- pred_kurt$aggregate + 1.96 * pred_kurt_sd
+
+# Write to csv
+predictions_df <- data.frame(
+  Mean = pred_mean$aggregate,
+  Sd = pred_sd$aggregate,
+  Skew = pred_skew$aggregate,
+  Kurt = pred_kurt$aggregate
+)
+final_df <- cbind(test %>% dplyr::select(Re, St, Fr), predictions_df)
+write.csv(final_df, "data-test.csv", row.names=FALSE)
+```
+
+```{r, echo=FALSE}
+make_plot_Re <- function(df, ylab) {
+  ggplot(df, aes(x = Re, y = Pred)) +
+    geom_point(alpha = 0.6) +
+    geom_ribbon(aes(ymin = Lower, ymax = Upper), alpha = 0.15) +
+    labs(x = "Re", y = ylab) +
+    theme_minimal()
+}
+```
+
+```{r, fig.height = 3, fig.width = 3, fig.cap="Predicted Summary Statistics vs. Re", echo=FALSE}
+df_mean <- data.frame(Re = test$Re,
+                      St = test$St,
+                      Fr = test$Fr,
+                      Pred = pred_mean$aggregate,
+                      Lower = pred_lower_mean,
+                      Upper = pred_upper_mean)
+
+df_sd <- data.frame(Re = test$Re,
+                    St = test$St,
+                    Fr = test$Fr,
+                    Pred = pred_sd$aggregate,
+                    Lower = pred_lower_sd,
+                    Upper = pred_upper_sd)
+
+df_skew <- data.frame(Re = test$Re,
+                      St = test$St,
+                      Fr = test$Fr,
+                      Pred = pred_skew$aggregate,
+                      Lower = pred_lower_skew,
+                      Upper = pred_upper_skew)
+
+df_kurt <- data.frame(Re = test$Re,
+                      St = test$St,
+                      Fr = test$Fr,
+                      Pred = pred_kurt$aggregate,
+                      Lower = pred_lower_kurt,
+                      Upper = pred_upper_kurt)
+
+p1 <- make_plot_Re(df_mean, "Predicted Mean")
+p2 <- make_plot_Re(df_sd, "Predicted SD")
+p3 <- make_plot_Re(df_skew, "Predicted Skewness")
+p4 <- make_plot_Re(df_kurt, "Predicted Kurtosis")
+
+(p1 | p2) /
+(p3 | p4)
+```
+
+Figure 2 shows predicted summary statistics from the random forest model with the optimal number of decision trees found from 5-fold cross validation, against the Reynolds number. With the increase in the values of $Re$, we see that the predicted mean of cluster volume decreases, which coincides with our scientific insight that greater turbulent intensity breaks up cluster sizes, contributing to the decrease. So is the case for predicted standard deviation, where only a slight decline is observed, as we have concluded in our inference model that greater turbulence homogenizes cluster sizes slightly. On the other hand, we see that the change is more drastic for predicted skewness and kurtosis with higher values of $Re$, and the positive relationship is observed in the original pairwise plots between $Re$ and transformed skewness and kurtosis values.
+
+One thing to note, which also can be improved, is the 95% prediction interval shown in the plots. The interval is wide, which can be attributed to small data size and only three distinct values were observed for the Reynolds and Froude numbers. Hence more data may be desired for the random forest model to learn this complex particle turbulence relationship.
+
+## Conclusion
+
+It is easy to associate that the properties of turbulence and particles within the turbulent flow are correlated. Yet the relationship tends to be complex and non-linear that there aren't many pervasive models today that can predict the particle clustering distribution reliably. This study aims to go one step further towards that milestone by presenting two different models for inference and prediction: a multiple linear regression model to simplify our understanding, and a random forest model to increase our predictive accuracy with the given inputs: Reynolds number (turbulent intensity), Froude number (gravitational acceleration), and Stokes number (particle inertia).
+
+The inference model has given us insight into how gravity suppresses clusters, and so does greater turbulent intensity in breaking clusters and slightly homogenizing cluster sizes. The model for skewness and kurtosis have shown that higher inertial particles have the tendency to form extreme clusters, contributing to the increase in asymmetry and heaviness of the distribution tail.
+
+The random forest prediction model has shown predictive results that closely coincide with our scientific insights from inference and the original relationship between the parameters and the response variables.
+
+However, the wide prediction interval from the prediction model may be an area of improvement arising from small data used to train the model, as only three distinct values were observed for Reynolds and Froude numbers. Hence a further study with greater data size and other complex models such as neural networks for prediction may be desired.
